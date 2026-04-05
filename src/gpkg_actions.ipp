@@ -4328,6 +4328,36 @@ uint64_t estimate_current_installed_payload_bytes(
     return 0;
 }
 
+uint64_t estimate_current_installed_payload_bytes_fast(
+    const std::string& pkg_name,
+    bool* approximate_out = nullptr
+) {
+    if (approximate_out) *approximate_out = false;
+
+    PackageMetadata installed_meta;
+    if (get_installed_package_metadata(pkg_name, installed_meta)) {
+        uint64_t declared = 0;
+        bool declared_approximate = false;
+        if (estimate_declared_installed_bytes(installed_meta, &declared, &declared_approximate)) {
+            if (approximate_out) *approximate_out = declared_approximate;
+            return declared;
+        }
+    }
+
+    PackageMetadata repo_meta;
+    if (get_repo_package_info(pkg_name, repo_meta)) {
+        uint64_t declared = 0;
+        bool declared_approximate = false;
+        if (estimate_declared_installed_bytes(repo_meta, &declared, &declared_approximate)) {
+            if (approximate_out) *approximate_out = true;
+            return declared;
+        }
+    }
+
+    if (approximate_out) *approximate_out = true;
+    return 0;
+}
+
 CachedArchivePayloadInfo inspect_payload_tar_for_disk_estimate(const std::string& tar_path) {
     CachedArchivePayloadInfo info;
     std::vector<GpkgArchive::TarEntry> entries;
@@ -5319,20 +5349,15 @@ TransactionDiskEstimate estimate_install_transaction_disk_change(
             package_has_exact_live_install_state(pkg.name, nullptr, nullptr) ||
             package_is_base_system_provided(pkg.name) ||
             package_has_present_base_registry_entry_exact(pkg.name);
-        CachedArchivePayloadInfo archive_info;
-        bool have_archive_info = get_cached_archive_payload_info(pkg, &archive_info);
-        if (have_archive_info) {
-            target_bytes = archive_info.target_bytes;
-            target_approximate = archive_info.approximate;
-        } else if (!estimate_declared_installed_bytes(pkg, &target_bytes, &target_approximate)) {
+        if (!estimate_declared_installed_bytes(pkg, &target_bytes, &target_approximate)) {
             target_approximate = true;
         }
 
         if (has_live_payload_state) {
-            current_bytes = estimate_current_installed_payload_bytes(pkg.name, true, &current_approximate);
-        } else if (have_archive_info) {
-            current_bytes = measure_manifest_payload_bytes(archive_info.installed_paths);
-            current_approximate = archive_info.approximate;
+            current_bytes = estimate_current_installed_payload_bytes_fast(
+                pkg.name,
+                &current_approximate
+            );
         }
 
         estimate.approximate = estimate.approximate || target_approximate || current_approximate;
@@ -7699,19 +7724,21 @@ int handle_selfupgrade(int argc, char* argv[], const std::set<std::string>& inst
     if (!ensure_repo_index_available()) return 1;
 
     std::cout << "Checking " << GPKG_SELF_PACKAGE_NAME << " self-upgrade target..." << std::endl;
-    if (!ensure_repo_package_cache_loaded(verbose)) {
-        std::cerr << Color::RED
-                  << "E: Failed to load GeminiOS repository metadata for "
-                  << GPKG_SELF_PACKAGE_NAME << " self-upgrade."
-                  << Color::RESET << std::endl;
-        return 1;
-    }
-
     PackageMetadata self_meta;
-    if (!get_loaded_repo_package_info(GPKG_SELF_PACKAGE_NAME, self_meta)) {
+    std::string self_lookup_error;
+    if (!get_best_repo_source_exact_package_info(
+            GPKG_SELF_PACKAGE_NAME,
+            self_meta,
+            verbose,
+            &self_lookup_error
+        )) {
         std::cerr << Color::RED
-                  << "E: No " << GPKG_SELF_PACKAGE_NAME
-                  << " self-upgrade package was found in the configured GeminiOS repositories."
+                  << "E: Failed to resolve GeminiOS repository metadata for "
+                  << GPKG_SELF_PACKAGE_NAME << " self-upgrade";
+        if (!self_lookup_error.empty()) {
+            std::cerr << " (" << self_lookup_error << ")";
+        }
+        std::cerr << "."
                   << Color::RESET << std::endl;
         return 1;
     }
@@ -7750,17 +7777,17 @@ int handle_selfupgrade(int argc, char* argv[], const std::set<std::string>& inst
     }
 
     std::vector<PackageMetadata> install_queue = {self_meta};
-    UpgradeContext self_context = build_upgrade_context(verbose);
-    const std::set<std::string>& live_set =
-        self_context.exact_live_packages.empty() ? installed_cache : self_context.exact_live_packages;
+    std::set<std::string> self_live_set = get_registered_installed_package_set();
+    if (self_live_set.empty()) self_live_set = installed_cache;
+    if (have_exact_version) self_live_set.insert(GPKG_SELF_PACKAGE_NAME);
     TransactionPlan self_plan;
     std::string plan_error;
     if (!build_transaction_plan(
             install_queue,
-            live_set,
+            self_live_set,
             verbose,
             self_plan,
-            &self_context,
+            nullptr,
             &plan_error
         )) {
         std::cerr << Color::RED << "E: "

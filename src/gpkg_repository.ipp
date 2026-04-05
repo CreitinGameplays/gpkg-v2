@@ -63,6 +63,12 @@ bool ensure_repo_package_cache_loaded(bool verbose);
 bool build_current_repo_catalog(bool verbose, std::string* error_out = nullptr);
 bool ensure_current_upgrade_catalog(bool verbose, std::string* error_out = nullptr);
 bool ensure_repo_index_available();
+bool ensure_current_repo_source_catalog_shard(
+    const std::string& repo_url,
+    bool verbose,
+    int* package_count_out = nullptr,
+    std::string* error_out = nullptr
+);
 bool sync_debian_testing_index(
     bool verbose,
     bool* changed_out = nullptr,
@@ -2076,6 +2082,109 @@ bool get_repo_package_info(const std::string& pkg_name, PackageMetadata& out_met
     return get_loaded_repo_package_info(pkg_name, out_meta);
 }
 
+bool get_best_repo_source_exact_package_info(
+    const std::string& pkg_name,
+    PackageMetadata& out_meta,
+    bool verbose,
+    std::string* error_out = nullptr
+) {
+    if (error_out) error_out->clear();
+    out_meta = {};
+
+    const std::string canonical_name = canonicalize_package_name(pkg_name, verbose);
+    if (canonical_name.empty()) {
+        if (error_out) *error_out = "invalid package name";
+        return false;
+    }
+
+    auto urls = get_repo_urls();
+    if (urls.empty()) {
+        if (error_out) *error_out = "no GeminiOS repositories are configured";
+        return false;
+    }
+
+    bool found = false;
+    PackageMetadata best_meta;
+    std::string last_error;
+
+    for (const auto& url : urls) {
+        const std::string normalized = normalize_repo_base_url(url);
+        std::string shard_error;
+        if (!ensure_current_repo_source_catalog_shard(
+                normalized,
+                verbose,
+                nullptr,
+                &shard_error
+            )) {
+            if (!shard_error.empty()) {
+                last_error = shard_error;
+                VLOG(verbose, "Skipping self-upgrade source shard for "
+                             << normalized << ": " << shard_error);
+            }
+            continue;
+        }
+
+        const std::string shard_path = get_repo_source_catalog_shard_path(normalized);
+        const std::string index_path = get_repo_source_catalog_shard_index_path(normalized);
+        if (!ensure_repo_catalog_shard_index_ready(
+                shard_path,
+                index_path,
+                verbose,
+                normalized,
+                &shard_error
+            )) {
+            if (!shard_error.empty()) {
+                last_error = shard_error;
+                VLOG(verbose, "Skipping self-upgrade shard index for "
+                             << normalized << ": " << shard_error);
+            }
+            continue;
+        }
+
+        std::vector<RepoCatalogShardIndexEntry> shard_entries;
+        if (!read_repo_catalog_shard_index(index_path, shard_entries, &shard_error)) {
+            if (!shard_error.empty()) {
+                last_error = shard_error;
+                VLOG(verbose, "Skipping unreadable self-upgrade shard index for "
+                             << normalized << ": " << shard_error);
+            }
+            continue;
+        }
+
+        for (const auto& entry : shard_entries) {
+            if (canonicalize_package_name(entry.name, verbose) != canonical_name) continue;
+
+            PackageMetadata candidate;
+            if (!read_repo_shard_entry_at_offset(
+                    shard_path,
+                    entry.offset,
+                    candidate,
+                    &shard_error
+                )) {
+                if (!shard_error.empty()) last_error = shard_error;
+                continue;
+            }
+
+            if (!found || should_prefer_repo_candidate(candidate, best_meta)) {
+                found = true;
+                best_meta = std::move(candidate);
+            }
+        }
+    }
+
+    if (!found) {
+        if (error_out) {
+            *error_out = last_error.empty()
+                ? "package not found in configured GeminiOS repository sources"
+                : last_error;
+        }
+        return false;
+    }
+
+    out_meta = std::move(best_meta);
+    return true;
+}
+
 bool query_full_universe_exact_package(
     const std::string& pkg_name,
     PackageUniverseResult& out_result,
@@ -2411,8 +2520,8 @@ bool append_repo_catalog_shard(
 bool ensure_current_repo_source_catalog_shard(
     const std::string& repo_url,
     bool verbose,
-    int* package_count_out = nullptr,
-    std::string* error_out = nullptr
+    int* package_count_out,
+    std::string* error_out
 ) {
     if (package_count_out) *package_count_out = 0;
     if (error_out) error_out->clear();
