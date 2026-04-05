@@ -1,0 +1,22 @@
+gpkg-v2 Licensing
+=================
+
+Copyright (C) 2026 CreitinGameplays
+
+`gpkg-v2` is free software. It is licensed under the GNU General Public
+License, version 2 or, at your option, any later version, matching the
+project-wide license used by apt.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See `COPYING.GPL` for the full GNU GPL v2 text.
+
+The vendored apt sources under `vendor/apt/` retain their upstream copyright
+and license metadata. See:
+
+- `vendor/apt/COPYING`
+- `vendor/apt/COPYING.GPL`
+
+Unless a more specific file-level notice says otherwise, treat the project as
+GPL-2.0-or-later.
+
