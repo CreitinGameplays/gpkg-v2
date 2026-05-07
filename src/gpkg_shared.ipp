@@ -644,6 +644,14 @@ bool g_unsafe_io = false;
 OptionalDependencyPolicy g_optional_dependency_policy;
 std::set<std::string> g_reported_debian_backend_fallbacks;
 
+bool gpkg_native_repo_only_mode_enabled() {
+    const char* env = getenv("GPKG_ENABLE_DEBIAN_BACKEND");
+    if (!env || env[0] == '\0') return true;
+
+    std::string value = ascii_lower_copy(std::string(env));
+    return !(value == "1" || value == "true" || value == "yes" || value == "on");
+}
+
 void maybe_log_debian_backend_selection(
     const DebianBackendSelection& selection,
     DebianBackendOperation operation,

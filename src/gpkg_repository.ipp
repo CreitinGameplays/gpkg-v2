@@ -2221,6 +2221,11 @@ bool query_full_universe_exact_package(
         }
     }
 
+    if (gpkg_native_repo_only_mode_enabled()) {
+        out_result.reason = "package is absent from configured GeminiOS repositories";
+        return false;
+    }
+
     if (!raw_context) {
         out_result.reason = "package is absent from the curated local package universe";
         return false;
@@ -2385,6 +2390,11 @@ bool resolve_full_universe_relation_candidate(
     }
 
     if (try_repo_candidate()) return true;
+
+    if (gpkg_native_repo_only_mode_enabled()) {
+        out_result.reason = "no repository package or provider candidate";
+        return false;
+    }
 
     if (!raw_context) {
         out_result.reason = "no repository package or provider candidate";
@@ -3419,99 +3429,10 @@ int handle_search(const std::string& query, bool verbose) {
         }
     }
 
-    std::string preview_error;
-    bool preview_available = foreach_debian_search_preview_entry(
-        verbose,
-        [&](const DebianSearchPreviewEntry& preview) {
-            if (matches.count(preview.meta.name) != 0) return true;
-
-            bool matched = find_case_insensitive_substring(preview.meta.name, normalized_query) != std::string::npos ||
-                find_case_insensitive_substring(preview.meta.description, normalized_query) != std::string::npos;
-            if (!matched &&
-                find_case_insensitive_substring(preview.meta.debian_package, normalized_query) != std::string::npos) {
-                matched = true;
-            }
-            if (!matched) {
-                for (const auto& raw_name : preview.raw_names) {
-                    if (find_case_insensitive_substring(raw_name, normalized_query) != std::string::npos) {
-                        matched = true;
-                        break;
-                    }
-                }
-            }
-            if (!matched) return true;
-
-            SearchResultDisplay display;
-            display.meta = preview.meta;
-            display.on_demand = true;
-            display.installable = preview.installable;
-            display.reason = preview.reason;
-            matches[display.meta.name] = display;
-            return true;
-        },
-        &preview_error
-    );
-
-    RawDebianContext raw_context;
-    std::string raw_load_error;
-    bool raw_available = false;
-    if (!preview_available) {
-        raw_available = ensure_raw_debian_context_loaded(raw_context, verbose, &raw_load_error);
-        std::map<std::string, RawDebianAvailabilityResult> raw_matches;
-        auto should_prefer_raw_search_result = [&](const RawDebianAvailabilityResult& candidate,
-                                                   const RawDebianAvailabilityResult& current) {
-            if (candidate.installable != current.installable) return candidate.installable;
-            return compare_versions(candidate.meta.version, current.meta.version) > 0;
-        };
-        if (raw_available) {
-            for (const auto& entry : raw_context.import_name_to_raw_names) {
-                bool matched = find_case_insensitive_substring(entry.key, normalized_query) != std::string::npos;
-                if (!matched) {
-                    for (const auto& raw_name : entry.raw_names) {
-                        if (find_case_insensitive_substring(raw_name, normalized_query) != std::string::npos) {
-                            matched = true;
-                            break;
-                        }
-                    }
-                }
-
-                RawDebianAvailabilityResult result;
-                std::string raw_reason;
-                if (!query_raw_debian_exact_package(entry.key, raw_context, result, verbose, &raw_reason)) {
-                    continue;
-                }
-                if (!matched &&
-                    find_case_insensitive_substring(result.meta.description, normalized_query) == std::string::npos) {
-                    continue;
-                }
-                if (g_repo_available_package_cache.count(result.meta.name) != 0) continue;
-
-                auto existing = raw_matches.find(result.meta.name);
-                if (existing == raw_matches.end() ||
-                    should_prefer_raw_search_result(result, existing->second)) {
-                    raw_matches[result.meta.name] = result;
-                }
-            }
-        }
-
-        for (const auto& entry : raw_matches) {
-            SearchResultDisplay display;
-            display.meta = entry.second.meta;
-            display.on_demand = true;
-            display.installable = entry.second.installable;
-            display.reason = entry.second.reason;
-            matches[display.meta.name] = display;
-        }
-    }
-
     if (matches.empty()) {
-        if (!preview_available && !raw_available) {
+        if (!have_repo_cache) {
             std::cerr << Color::RED << "E: "
-                      << (!preview_error.empty()
-                              ? preview_error
-                              : (raw_load_error.empty()
-                                      ? "cached Debian metadata is unavailable; run 'gpkg update'"
-                                      : raw_load_error))
+                      << "local GeminiOS package catalog is unavailable; run 'gpkg update'"
                       << Color::RESET << std::endl;
             return 1;
         }
@@ -3552,23 +3473,12 @@ int handle_search(const std::string& query, bool verbose) {
 
 int handle_show(const std::string& pkg_name, bool verbose) {
     VLOG(verbose, "Showing package metadata for '" << pkg_name << "'");
-    RawDebianContext raw_context;
     PackageUniverseResult result;
-    if (!query_full_universe_exact_package(pkg_name, result, verbose, &raw_context)) {
-        DebianSearchPreviewEntry preview;
-        std::string preview_error;
-        if (get_debian_search_preview_exact_package(pkg_name, preview, verbose, &preview_error)) {
-            result.found = true;
-            result.installable = preview.installable;
-            result.raw_only = true;
-            result.reason = preview.reason;
-            result.meta = preview.meta;
-        } else {
-            std::cerr << Color::RED << "E: Package '" << pkg_name << "' was not found in the local package universe";
-            if (!result.reason.empty()) std::cerr << " (" << result.reason << ")";
-            std::cerr << "." << Color::RESET << std::endl;
-            return 1;
-        }
+    if (!query_full_universe_exact_package(pkg_name, result, verbose, nullptr)) {
+        std::cerr << Color::RED << "E: Package '" << pkg_name << "' was not found in configured GeminiOS repositories";
+        if (!result.reason.empty()) std::cerr << " (" << result.reason << ")";
+        std::cerr << "." << Color::RESET << std::endl;
+        return 1;
     }
     PackageMetadata meta = result.meta;
 

@@ -6971,77 +6971,169 @@ RepairInspection inspect_repair_state(bool verbose) {
     return inspect_repair_state(get_registered_package_names(), verbose);
 }
 
+bool execute_native_install_queue(
+    const std::vector<PackageMetadata>& install_queue,
+    const TransactionPlan& plan,
+    const std::set<std::string>& manual_targets,
+    const std::set<std::string>& previously_registered,
+    bool verbose,
+    size_t* installed_count_out = nullptr
+) {
+    if (installed_count_out) *installed_count_out = 0;
+    if (install_queue.empty()) return true;
+
+    size_t installed_count = 0;
+    size_t progress_width = 0;
+
+    for (size_t i = 0; i < install_queue.size(); ++i) {
+        const PackageMetadata& meta = install_queue[i];
+        if (!verbose) {
+            render_package_progress("current", i, install_queue.size(), meta.name, &progress_width);
+        }
+
+        InstallCommandResult install_result = install_package_v2(meta, verbose);
+        if (!install_result.success) {
+            if (!verbose) finish_progress_line(&progress_width);
+            std::cerr << Color::RED << "E: Failed to install " << meta.name << Color::RESET;
+            if (!verbose && !install_result.log_path.empty()) {
+                std::cerr << " See " << install_result.log_path << " for details.";
+            }
+            std::cerr << std::endl;
+            return false;
+        }
+
+        std::string failed_pkg;
+        std::string failed_log;
+        if (!retire_replaced_packages_live(
+                plan,
+                meta.name,
+                verbose,
+                &failed_pkg,
+                &failed_log
+            )) {
+            if (!verbose) finish_progress_line(&progress_width);
+            std::cerr << Color::RED << "E: Failed to retire replaced package "
+                      << (failed_pkg.empty() ? meta.name : failed_pkg)
+                      << Color::RESET;
+            if (!verbose && !failed_log.empty()) {
+                std::cerr << " See " << failed_log << " for details.";
+            }
+            std::cerr << std::endl;
+            return false;
+        }
+
+        bool should_be_manual = manual_targets.count(meta.name) != 0;
+        if (!update_package_auto_install_state_after_install(
+                meta.name,
+                should_be_manual,
+                previously_registered
+            )) {
+            if (!verbose) finish_progress_line(&progress_width);
+            std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
+                      << meta.name << Color::RESET << std::endl;
+            return false;
+        }
+
+        queue_triggers_for_package(meta.name);
+        ++installed_count;
+        if (!verbose) {
+            render_package_progress("current", i + 1, install_queue.size(), meta.name, &progress_width);
+        }
+    }
+
+    if (!verbose) finish_progress_line(&progress_width);
+    if (installed_count_out) *installed_count_out = installed_count;
+    return true;
+}
+
 int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
-    (void)installed_cache;
     if (!ensure_repo_index_available()) return 1;
 
     std::cout << "Reading package lists..." << std::endl;
     if (!ensure_repo_package_cache_loaded(verbose)) return 1;
     std::cout << "Optional dependency policy: " << describe_optional_dependency_policy() << std::endl;
-    UpgradeContext context = build_upgrade_context(verbose);
-    if (!context.upgrade_catalog_available) {
-        std::cerr << Color::RED << "E: "
-                  << (context.upgrade_catalog_problem.empty()
-                          ? "upgrade catalog is unavailable; run 'gpkg update'"
-                          : context.upgrade_catalog_problem)
-                  << Color::RESET << std::endl;
-        return 1;
-    }
-    PreparedUpgradeState prepared;
-    if (!prepare_upgrade_transaction(context, verbose, prepared)) {
-        std::cerr << Color::RED << "E: "
-                  << (prepared.fatal_error.empty()
-                          ? "could not build a safe upgrade plan"
-                          : prepared.fatal_error)
-                  << Color::RESET << std::endl;
-        return 1;
-    }
-    std::vector<PackageMetadata>& upgrade_queue = prepared.upgrade_queue;
-    std::vector<UpgradePlanEntry>& explicit_targets = prepared.explicit_targets;
-
-    {
-        std::string live_session_reason;
-        if (libapt_plan_is_unsafe_for_live_session(prepared.libapt_plan, verbose, &live_session_reason)) {
-            std::cerr << Color::RED << "E: "
-                      << (live_session_reason.empty()
-                              ? "refusing to modify essential base packages in a live GeminiOS session"
-                              : live_session_reason)
-                      << Color::RESET << std::endl;
-            return 1;
-        }
-    }
-
-    if (upgrade_queue.empty()) {
-        for (const auto& warning : prepared.skipped_managed_packages) {
-            std::cout << Color::YELLOW << "W: " << warning << Color::RESET << std::endl;
-        }
-        if (!prepared.skipped_managed_packages.empty()) {
-            std::cerr << Color::RED
-                      << "E: No safe upgrades are currently available under the current repository and policy state."
-                      << Color::RESET << std::endl;
-            return 1;
-        }
+    std::vector<std::string> registered_packages = get_registered_package_names();
+    if (registered_packages.empty()) {
         std::cout << "All packages are up to date." << std::endl;
         return 0;
     }
 
-    for (const auto& warning : prepared.skipped_managed_packages) {
-        std::cout << Color::YELLOW << "W: " << warning << Color::RESET << std::endl;
+    std::vector<PackageMetadata> upgrade_queue;
+    std::vector<UpgradePlanEntry> explicit_targets;
+    std::set<std::string> queued_packages;
+    std::set<std::string> explicit_target_names;
+    std::set<std::string> target_walk;
+    std::set<std::string> dependency_visited;
+    std::vector<std::string> skipped_packages;
+    std::map<std::string, std::vector<std::string>> companion_map = load_upgrade_companions();
+
+    for (const auto& pkg : registered_packages) {
+        std::string failure_reason;
+        if (!queue_upgrade_target(
+                {pkg, "", ""},
+                companion_map,
+                upgrade_queue,
+                explicit_targets,
+                queued_packages,
+                explicit_target_names,
+                target_walk,
+                dependency_visited,
+                installed_cache,
+                verbose,
+                g_force_reinstall,
+                nullptr,
+                nullptr,
+                &failure_reason
+            )) {
+            std::cerr << Color::RED << "E: "
+                      << (failure_reason.empty()
+                              ? ("could not build a safe upgrade plan for " + pkg)
+                              : failure_reason)
+                      << Color::RESET << std::endl;
+            return 1;
+        }
+        if (std::find_if(
+                explicit_targets.begin(),
+                explicit_targets.end(),
+                [&](const UpgradePlanEntry& entry) { return entry.meta.name == pkg; }
+            ) == explicit_targets.end()) {
+            skipped_packages.push_back(pkg);
+        }
+    }
+
+    TransactionPlan plan;
+    std::string plan_error;
+    if (!build_transaction_plan(
+            upgrade_queue,
+            installed_cache,
+            verbose,
+            plan,
+            nullptr,
+            &plan_error
+        )) {
+        std::cerr << Color::RED << "E: "
+                  << (plan_error.empty() ? "could not build a safe upgrade plan" : plan_error)
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+    upgrade_queue = plan.install_queue;
+
+    if (upgrade_queue.empty()) {
+        std::cout << "All packages are up to date." << std::endl;
+        return 0;
     }
 
     std::set<std::string> planned_names;
     for (const auto& pkg : upgrade_queue) planned_names.insert(pkg.name);
-    std::set<std::string> explicit_target_names;
-    for (const auto& entry : explicit_targets) explicit_target_names.insert(entry.meta.name);
+    std::set<std::string> explicit_target_name_set;
+    for (const auto& entry : explicit_targets) explicit_target_name_set.insert(entry.meta.name);
 
     std::vector<UpgradePlanEntry> installed_upgrades;
     std::vector<UpgradePlanEntry> installed_reinstalls;
-    std::vector<UpgradePlanEntry> base_bootstraps;
     for (const auto& entry : explicit_targets) {
         if (!planned_names.count(entry.meta.name)) continue;
         if (entry.was_installed && entry.reinstall_only) installed_reinstalls.push_back(entry);
-        else if (entry.was_installed) installed_upgrades.push_back(entry);
-        else base_bootstraps.push_back(entry);
+        else installed_upgrades.push_back(entry);
     }
 
     if (!installed_upgrades.empty()) {
@@ -7060,17 +7152,9 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         }
     }
 
-    if (!base_bootstraps.empty()) {
-        std::cout << "The following base packages will be upgraded using the Debian backend:" << std::endl;
-        for (const auto& entry : base_bootstraps) {
-            std::cout << "  " << Color::GREEN << entry.meta.name << Color::RESET
-                      << " (" << entry.meta.version << ")" << std::endl;
-        }
-    }
-
     std::vector<PackageMetadata> dependency_installs;
     for (const auto& pkg : upgrade_queue) {
-        if (!explicit_target_names.count(pkg.name)) dependency_installs.push_back(pkg);
+        if (!explicit_target_name_set.count(pkg.name)) dependency_installs.push_back(pkg);
     }
     if (!dependency_installs.empty()) {
         std::cout << "Additional dependency packages will be installed:" << std::endl;
@@ -7079,13 +7163,14 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
                       << " (" << pkg.version << ")" << std::endl;
         }
     }
-
-    print_libapt_remove_preview(prepared.libapt_plan);
+    for (const auto& pkg : skipped_packages) {
+        VLOG(verbose, "Skipping " << pkg << " because no newer repository candidate is available.");
+    }
 
     print_transaction_disk_change_summary(
         estimate_install_transaction_disk_change(
             upgrade_queue,
-            !prepared.libapt_plan.remove_packages.empty()
+            !plan.retirements.empty()
         )
     );
 
@@ -7111,82 +7196,31 @@ int handle_upgrade(const std::set<std::string>& installed_cache, bool verbose) {
         return 1;
     }
 
-    size_t installed_count = 0;
-    std::vector<std::string> failures;
-    bool mutated_runtime_state = false;
-    std::set<std::string> manual_targets;
-    for (const auto& entry : explicit_targets) {
-        if (!entry.was_installed && planned_names.count(entry.meta.name) != 0) {
-            manual_targets.insert(entry.meta.name);
-        }
-    }
-
     std::cout << Color::CYAN << "[*] Installing " << upgrade_queue.size()
               << " package(s)..." << Color::RESET << std::endl;
-    if (prepared.libapt_plan.ordered_operations.empty()) {
-        std::cerr << Color::RED
-                  << "E: libapt-pkg did not produce an executable operation order for this upgrade"
-                  << Color::RESET << std::endl;
-        return 1;
-    }
-
-    LibAptExecutionResult exec_result = execute_libapt_install_like_plan(
-        prepared.libapt_plan,
-        nullptr,
-        manual_targets,
-        context.exact_live_packages,
-        verbose,
-        prepared.auto_state_after.empty() ? nullptr : &prepared.auto_state_after
-    );
-    if (!exec_result.success) {
-        std::string failed_name = exec_result.failed_package.empty()
-            ? (upgrade_queue.empty() ? std::string() : upgrade_queue.front().name)
-            : exec_result.failed_package;
-        std::cerr << Color::RED << "E: Failed to install ";
-        if (!failed_name.empty()) std::cerr << failed_name;
-        else std::cerr << "the planned APT transaction";
-        std::cerr << Color::RESET;
-        if (!verbose && !exec_result.log_path.empty()) {
-            std::cerr << " (see " << exec_result.log_path << ")";
-        }
-        std::cerr << std::endl;
-        failures.push_back(failed_name.empty() ? "unknown" : failed_name);
-    } else {
-        installed_count = exec_result.installed_count;
-        mutated_runtime_state = exec_result.mutated_runtime_state;
-    }
-    if (!verbose) {
-        std::cout << Color::GREEN << "✓ Installed " << installed_count << "/" << upgrade_queue.size()
-                  << " package(s)." << Color::RESET << std::endl;
-    }
-
-    if (!failures.empty()) {
-        std::cout << Color::CYAN << "Upgrade summary: "
-                  << installed_upgrades.size() << " upgraded, "
-                  << installed_reinstalls.size() << " reinstalled, "
-                  << base_bootstraps.size() << " imported from base image, "
-                  << dependency_installs.size() << " dependency installs, "
-                  << download_report.downloaded_count << " downloaded, "
-                  << download_report.reused_count << " reused from cache, "
-                  << format_total_bytes(download_report.downloaded_bytes) << " transferred."
-                  << Color::RESET << std::endl;
-        if (mutated_runtime_state) queue_runtime_linker_state_refresh();
-        std::cerr << Color::RED << "E: Upgrade completed with failures: "
-                  << join_strings(failures) << Color::RESET << std::endl;
+    size_t installed_count = 0;
+    if (!execute_native_install_queue(
+            upgrade_queue,
+            plan,
+            {},
+            installed_cache,
+            verbose,
+            &installed_count
+        )) {
+        queue_runtime_linker_state_refresh();
         return 1;
     }
 
     std::cout << Color::CYAN << "Upgrade summary: "
               << installed_upgrades.size() << " upgraded, "
               << installed_reinstalls.size() << " reinstalled, "
-              << base_bootstraps.size() << " imported from base image, "
               << dependency_installs.size() << " dependency installs, "
               << download_report.downloaded_count << " downloaded, "
               << download_report.reused_count << " reused from cache, "
               << format_total_bytes(download_report.downloaded_bytes) << " transferred."
               << Color::RESET << std::endl;
 
-    if (mutated_runtime_state) queue_runtime_linker_state_refresh();
+    queue_runtime_linker_state_refresh();
     return 0;
 }
 
@@ -7928,7 +7962,6 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     std::vector<std::string> operands = collect_cli_operands(argc, argv, 2);
     bool needs_repo_index = false;
     bool mutated_runtime_state = false;
-    LibAptTransactionPlanResult libapt_plan;
 
     if (operands.empty()) {
         std::cerr << "Usage: gpkg install <package_name> [options]" << std::endl;
@@ -7961,54 +7994,23 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
     }
 
     if (!repo_operands.empty()) {
-        std::vector<std::string> apt_targets = repo_operands;
-        VLOG(verbose, "Handing " << apt_targets.size()
-                                 << " requested package(s) to the libapt-pkg planner.");
-        std::set<std::string> reinstall_targets;
-        if (g_force_reinstall) {
-            reinstall_targets.insert(apt_targets.begin(), apt_targets.end());
-        }
-        std::string apt_error;
-        if (!libapt_plan_install_like_transaction(
-                apt_targets,
-                reinstall_targets,
-                false,
-                verbose,
-                libapt_plan,
-                &apt_error
-            )) {
-            RawDebianContext diagnostics_context;
-            for (const auto& arg : repo_operands) {
-                if (maybe_report_unavailable_install_target(
-                        arg,
-                        verbose,
-                        &diagnostics_context
-                    )) {
-                    return 1;
-                }
+        std::set<std::string> visited;
+        for (const auto& arg : repo_operands) {
+            Dependency dep = parse_dependency(arg);
+            if (dep.name.empty()) dep.name = relation_name_from_text(arg);
+            if (!resolve_dependencies(
+                    dep.name,
+                    dep.op,
+                    dep.version,
+                    install_queue,
+                    visited,
+                    installed_cache,
+                    verbose,
+                    explicit_install_target_requires_queue(arg, verbose)
+                )) {
+                maybe_report_unavailable_install_target(arg, verbose, nullptr);
+                return 1;
             }
-
-            std::cerr << Color::RED
-                      << "E: "
-                      << (apt_error.empty()
-                              ? "libapt-pkg failed to resolve the requested install transaction"
-                              : apt_error)
-                      << Color::RESET << std::endl;
-            return 1;
-        }
-
-        install_queue = collect_libapt_install_queue(libapt_plan, true);
-    }
-
-    {
-        std::string live_session_reason;
-        if (libapt_plan_is_unsafe_for_live_session(libapt_plan, verbose, &live_session_reason)) {
-            std::cerr << Color::RED << "E: "
-                      << (live_session_reason.empty()
-                              ? "refusing to modify essential base packages in a live GeminiOS session"
-                              : live_session_reason)
-                      << Color::RESET << std::endl;
-            return 1;
         }
     }
 
@@ -8081,48 +8083,53 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         }
         install_queue = std::move(deduped_install_queue);
     }
-    VLOG(verbose, "Using libapt-pkg solved queue directly for install execution.");
-
-    std::set<std::string> explicit_manual_targets;
-    std::map<std::string, const LibAptPlannedInstallAction*> install_actions_by_name;
-    for (const auto& action : libapt_plan.install_actions) {
-        install_actions_by_name[canonicalize_package_name(action.meta.name, verbose)] = &action;
-        if (!action.explicit_target) continue;
-        explicit_manual_targets.insert(action.meta.name);
-    }
 
     if (install_queue.empty()) {
-        for (const auto& pkg_name : explicit_manual_targets) {
-            if (!update_package_auto_install_state_after_install(pkg_name, true, installed_cache)) {
-                std::cerr << Color::RED << "E: Failed to update gpkg auto-install state for "
-                          << pkg_name << Color::RESET << std::endl;
-                return 1;
-            }
-        }
         if (mutated_runtime_state) queue_runtime_linker_state_refresh();
         if (local_files.empty()) std::cout << "Nothing to do." << std::endl;
         return 0;
     }
 
+    TransactionPlan plan;
+    std::string plan_error;
+    if (!build_transaction_plan(
+            install_queue,
+            installed_cache,
+            verbose,
+            plan,
+            nullptr,
+            &plan_error
+        )) {
+        std::cerr << Color::RED << "E: "
+                  << (plan_error.empty() ? "could not build a safe install transaction" : plan_error)
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+    install_queue = plan.install_queue;
+
+    std::set<std::string> explicit_manual_targets;
+    for (const auto& requested_name : repo_operands) {
+        std::string resolved_name = resolve_requested_package_for_manual_marking(
+            requested_name,
+            install_queue,
+            installed_cache,
+            verbose
+        );
+        if (!resolved_name.empty()) explicit_manual_targets.insert(resolved_name);
+    }
+
     std::vector<PackageMetadata> new_installs;
     std::vector<std::pair<PackageMetadata, std::string>> reinstalls;
     std::vector<std::pair<PackageMetadata, std::string>> upgrades;
-    VLOG(verbose, "Summarizing libapt-pkg install preview.");
     for (const auto& pkg : install_queue) {
-        std::string canonical_name = canonicalize_package_name(pkg.name, verbose);
-        auto action_it = install_actions_by_name.find(canonical_name);
-        if (action_it == install_actions_by_name.end() || action_it->second == nullptr) {
+        std::string current_version;
+        bool was_installed = get_local_installed_package_version(pkg.name, &current_version, nullptr);
+        if (!was_installed) {
             new_installs.push_back(pkg);
-            continue;
-        }
-
-        const LibAptPlannedInstallAction& action = *action_it->second;
-        if (!action.was_installed) {
-            new_installs.push_back(pkg);
-        } else if (action.reinstall_only) {
-            reinstalls.push_back({pkg, action.current_version});
+        } else if (compare_versions(pkg.version, current_version) == 0) {
+            reinstalls.push_back({pkg, current_version});
         } else {
-            upgrades.push_back({pkg, action.current_version});
+            upgrades.push_back({pkg, current_version});
         }
     }
 
@@ -8148,13 +8155,10 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
         }
     }
 
-    print_libapt_remove_preview(libapt_plan);
-
-    VLOG(verbose, "Estimating install transaction disk impact.");
     print_transaction_disk_change_summary(
         estimate_install_transaction_disk_change(
             install_queue,
-            !libapt_plan.remove_packages.empty()
+            !plan.retirements.empty()
         )
     );
 
@@ -8196,36 +8200,20 @@ int handle_install(int argc, char* argv[], const std::set<std::string>& installe
 
     std::cout << Color::CYAN << "[*] Installing " << install_queue.size()
               << " package(s)..." << Color::RESET << std::endl;
-    if (libapt_plan.ordered_operations.empty()) {
-        std::cerr << Color::RED
-                  << "E: libapt-pkg did not produce an executable operation order for this install"
-                  << Color::RESET << std::endl;
+    size_t installed_count = 0;
+    if (!execute_native_install_queue(
+            install_queue,
+            plan,
+            explicit_manual_targets,
+            installed_cache,
+            verbose,
+            &installed_count
+        )) {
         return 1;
     }
 
-    LibAptExecutionResult exec_result = execute_libapt_install_like_plan(
-        libapt_plan,
-        nullptr,
-        explicit_manual_targets,
-        installed_cache,
-        verbose,
-        !libapt_plan.auto_state_after.empty() ? &libapt_plan.auto_state_after : nullptr
-    );
-    if (!exec_result.success) {
-        std::cerr << Color::RED << "E: Installation stopped";
-        if (!exec_result.failed_package.empty()) {
-            std::cerr << " at " << exec_result.failed_package;
-        }
-        std::cerr << Color::RESET;
-        if (!verbose && !exec_result.log_path.empty()) {
-            std::cerr << " See " << exec_result.log_path << " for details.";
-        }
-        std::cerr << std::endl;
-        return 1;
-    }
-
-    if (exec_result.mutated_runtime_state) queue_runtime_linker_state_refresh();
-    std::cout << Color::GREEN << "✓ Installed " << exec_result.installed_count
+    queue_runtime_linker_state_refresh();
+    std::cout << Color::GREEN << "✓ Installed " << installed_count
               << " package(s)." << Color::RESET << std::endl;
     return 0;
 }
