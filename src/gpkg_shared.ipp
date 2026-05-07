@@ -415,21 +415,17 @@ std::string ascii_lower_copy(const std::string& value) {
 }
 
 bool libapt_pkg_backend_is_compiled() {
-#if defined(GPKG_HAVE_WORKING_LIBAPT_PKG_BACKEND)
-    return true;
-#else
     return false;
-#endif
 }
 
 std::string describe_debian_backend_kind(DebianBackendKind kind) {
     switch (kind) {
         case DebianBackendKind::Legacy:
-            return "legacy";
+            return "native-only";
         case DebianBackendKind::LibAptPkg:
-            return "libapt-pkg";
+            return "disabled";
     }
-    return "legacy";
+    return "native-only";
 }
 
 std::string describe_debian_backend_operation(DebianBackendOperation operation) {
@@ -452,42 +448,15 @@ DebianBackendSelection select_debian_backend(
     DebianBackendOperation operation,
     bool verbose
 ) {
+    DebianBackendSelection selection;
     (void)operation;
     (void)verbose;
-
-    DebianBackendSelection selection;
-    selection.selected = DebianBackendKind::LibAptPkg;
-    selection.requested = DebianBackendKind::LibAptPkg;
+    selection.selected = DebianBackendKind::Legacy;
+    selection.requested = DebianBackendKind::Legacy;
     selection.auto_selected = true;
-    selection.libapt_pkg_compiled = libapt_pkg_backend_is_compiled();
-
-    const char* env = getenv("GPKG_DEBIAN_BACKEND");
-    std::string requested = env ? std::string(env) : "auto";
-    size_t start = requested.find_first_not_of(" \t\r\n");
-    size_t end = requested.find_last_not_of(" \t\r\n");
-    if (start == std::string::npos) requested = "auto";
-    else requested = ascii_lower_copy(requested.substr(start, end - start + 1));
-    if (requested.empty()) requested = "auto";
-
-    if (requested == "libapt-pkg" || requested == "libapt" || requested == "apt") {
-        selection.requested = DebianBackendKind::LibAptPkg;
-        selection.auto_selected = false;
-        return selection;
-    }
-
-    if (requested == "legacy") {
-        selection.requested = DebianBackendKind::Legacy;
-        selection.auto_selected = false;
-        selection.fell_back = true;
-        selection.reason = selection.libapt_pkg_compiled
-            ? "legacy Debian backend has been removed; using libapt-pkg"
-            : "legacy Debian backend has been removed and libapt-pkg is not compiled into this gpkg build";
-    }
-
-    if (!selection.libapt_pkg_compiled && selection.reason.empty()) {
-        selection.reason =
-            "libapt-pkg backend is not available in this gpkg build";
-    }
+    selection.libapt_pkg_compiled = false;
+    selection.fell_back = false;
+    selection.reason.clear();
     return selection;
 }
 
@@ -2208,7 +2177,8 @@ std::string join_url_path(const std::string& base, const std::string& relative) 
 }
 
 bool package_is_debian_source(const PackageMetadata& meta) {
-    return meta.source_kind == "debian";
+    (void)meta;
+    return false;
 }
 
 #define VLOG(v, msg) do { if (v) std::cout << "[DEBUG] " << msg << std::endl; } while(0)

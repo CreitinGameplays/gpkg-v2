@@ -534,17 +534,10 @@ bool sync_repo_source_index(
 std::string build_repo_catalog_fingerprint(const std::vector<std::string>& urls) {
     std::vector<std::string> fields = {"repo-catalog-v1"};
 
-    std::string packages_txt = get_debian_packages_cache_path();
-    if (access(packages_txt.c_str(), F_OK) == 0) {
-        fields.push_back(build_debian_imported_index_cache_fingerprint(packages_txt));
-    } else {
-        fields.push_back("debian:missing");
-    }
-
     for (const auto& url : urls) {
         std::string normalized = normalize_repo_base_url(url);
         fields.push_back(normalized);
-        fields.push_back(debian_cache_fingerprint_component(get_repo_source_index_json_path(normalized)));
+        fields.push_back(sha256_hex_file(get_repo_source_index_json_path(normalized)));
     }
 
     return fnv1a64_hex_digest(fields);
@@ -555,14 +548,7 @@ std::string build_repo_source_catalog_shard_fingerprint(const std::string& repo_
     return fnv1a64_hex_digest({
         "repo-shard-v1",
         normalized,
-        debian_cache_fingerprint_component(get_repo_source_index_json_path(normalized))
-    });
-}
-
-std::string build_debian_catalog_shard_fingerprint(const std::string& packages_path) {
-    return fnv1a64_hex_digest({
-        "debian-shard-v1",
-        build_debian_imported_index_cache_fingerprint(packages_path)
+        sha256_hex_file(get_repo_source_index_json_path(normalized))
     });
 }
 
@@ -2417,16 +2403,14 @@ bool resolve_full_universe_relation_candidate(
 
 int handle_list_repos() {
     auto urls = get_repo_urls();
-    DebianBackendConfig debian = load_debian_backend_config(false);
     std::cout << "Configured package sources:" << std::endl;
-    std::cout << "  1. Debian testing (" << debian.packages_url << ")" << std::endl;
     if (urls.empty()) {
-        std::cout << "  2. No additional S2 repositories configured." << std::endl;
+        std::cout << "  1. No GeminiOS repositories configured." << std::endl;
         return 0;
     }
 
     for (size_t i = 0; i < urls.size(); ++i) {
-        std::cout << "  " << (i + 2) << ". " << normalize_repo_base_url(urls[i]) << std::endl;
+        std::cout << "  " << (i + 1) << ". " << normalize_repo_base_url(urls[i]) << std::endl;
     }
     return 0;
 }
@@ -2815,59 +2799,10 @@ bool build_current_repo_catalog(bool verbose, std::string* error_out) {
         ++success_count;
     }
 
-    std::string debian_error;
-    std::string packages_txt = get_debian_packages_cache_path();
-    if (access(packages_txt.c_str(), F_OK) == 0 &&
-        ensure_current_debian_catalog_shard(verbose, nullptr, &debian_error)) {
-        const std::string shard_path = get_debian_catalog_shard_path();
-        const std::string index_path = get_debian_catalog_shard_index_path();
-        if (ensure_repo_catalog_shard_index_ready(
-                shard_path,
-                index_path,
-                verbose,
-                "Debian testing",
-                &debian_error
-            )) {
-            std::vector<RepoCatalogShardIndexEntry> shard_entries;
-            if (read_repo_catalog_shard_index(index_path, shard_entries, &debian_error)) {
-                if (seen_shards.insert(shard_path).second) shard_paths.push_back(shard_path);
-                for (const auto& entry : shard_entries) {
-                    if (entry.name.empty()) continue;
-
-                    PackageMetadata candidate_meta;
-                    candidate_meta.name = entry.name;
-                    candidate_meta.version = entry.version;
-                    candidate_meta.source_kind = entry.source_kind;
-
-                    auto it = selected_packages.find(entry.name);
-                    if (it == selected_packages.end() ||
-                        should_prefer_repo_candidate(candidate_meta, it->second.meta)) {
-                        SelectedPackageEntry selected;
-                        selected.meta = candidate_meta;
-                        selected.locator = {shard_path, entry.offset};
-                        selected.provides = entry.provides;
-                        selected_packages[entry.name] = std::move(selected);
-                    }
-                }
-                ++success_count;
-            } else if (verbose && !debian_error.empty()) {
-                VLOG(verbose, "Skipping unreadable Debian shard index while rebuilding the runtime package index: "
-                             << debian_error);
-            }
-        }
-    } else if (verbose && !debian_error.empty()) {
-        VLOG(verbose, "Skipping the Debian catalog shard while rebuilding the repo catalog: "
-                     << debian_error);
-    }
-
     if (success_count == 0) {
         if (error_out) {
-            if (!debian_error.empty()) {
-                *error_out = debian_error;
-            } else {
-                *error_out = "no cached package sources are available; run '" +
-                             GPKG_CLI_NAME + " update'";
-            }
+            *error_out = "no cached package sources are available; run '" +
+                         GPKG_CLI_NAME + " update'";
         }
         return false;
     }
@@ -3293,35 +3228,12 @@ int handle_update(bool verbose) {
         }
     }
 
-    bool debian_changed = false;
-    std::string debian_result;
-    if (sync_debian_testing_index(verbose, &debian_changed, &debian_result)) {
-        ++success_count;
-        if (!debian_result.empty()) {
-            std::cout << Color::GREEN << debian_result << Color::RESET << std::endl;
-        }
-    } else if (!debian_result.empty()) {
-        std::cerr << Color::YELLOW << debian_result << Color::RESET << std::endl;
-    }
-
     if (success_count == 0) {
         std::cerr << Color::RED << "E: Failed to update any package indices." << Color::RESET << std::endl;
         return 1;
     }
 
-    bool debian_views_stale = false;
-    std::string packages_txt = get_debian_packages_cache_path();
-    if (access(packages_txt.c_str(), F_OK) == 0) {
-        debian_views_stale =
-            !debian_imported_index_cache_is_current(packages_txt) ||
-            !debian_compiled_record_cache_is_current();
-    }
-
-    if (debian_changed || debian_views_stale) {
-        invalidate_debian_derived_metadata_caches(verbose);
-    }
-
-    if (repo_sources_changed || debian_changed || debian_views_stale) {
+    if (repo_sources_changed) {
         remove(get_repo_catalog_path().c_str());
         remove(get_repo_catalog_state_path().c_str());
         remove(get_legacy_repo_index_path().c_str());
@@ -3361,20 +3273,6 @@ int handle_update(bool verbose) {
         return 1;
     }
 
-    bool libapt_cache_primed = false;
-    if (access(packages_txt.c_str(), F_OK) == 0) {
-        std::string libapt_prime_error;
-        if (!libapt_prime_planner_cache(verbose, &libapt_prime_error)) {
-            std::cerr << Color::YELLOW
-                      << "W: Failed to prime the libapt-pkg planner cache";
-            if (!libapt_prime_error.empty()) std::cerr << " (" << libapt_prime_error << ")";
-            std::cerr << ". Debian-backed installs may be slower until the cache is rebuilt."
-                      << Color::RESET << std::endl;
-        } else {
-            libapt_cache_primed = true;
-        }
-    }
-
     std::cout << Color::GREEN << "✓ Synced raw package indices from "
               << success_count << " source"
               << (success_count == 1 ? "" : "s")
@@ -3382,11 +3280,6 @@ int handle_update(bool verbose) {
     std::cout << Color::GREEN
               << "✓ Rebuilt compiled package catalogs for fast queries."
               << Color::RESET << std::endl;
-    if (libapt_cache_primed) {
-        std::cout << Color::GREEN
-                  << "✓ Primed the libapt-pkg planner cache for faster installs."
-                  << Color::RESET << std::endl;
-    }
 
     return 0;
 }

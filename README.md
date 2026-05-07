@@ -10,24 +10,18 @@ binaries are the canonical GeminiOS commands:
 - `gpkg-worker`
 
 This implementation handles repository metadata, dependency resolution,
-downloads, and package operations across two backends:
-
-- Debian packages are planned through vendored `apt`/`apt-private` logic and
-  installed natively through `dpkg`
-- GeminiOS-native `.gpkg` packages still use `gpkg-worker`
+downloads, and package operations for GeminiOS-native `.gpkg` packages.
+The canonical install-time worker remains `gpkg-worker`.
 
 ## License
 
-`gpkg-v2/` follows the same GPL-2-or-later licensing model as the vendored
-`apt` code it is built around.
+`gpkg-v2/` follows the same GPL-2-or-later licensing model as the GeminiOS
+package-manager sources.
 
 - `LICENSE` states the project-wide `gpkg-v2` licensing terms
 - `COPYING.GPL` carries the GNU GPL v2 text referenced by that metadata
-- `vendor/apt/COPYING` and `vendor/apt/COPYING.GPL` preserve apt's upstream
-  copyright and license metadata for the vendored code
-
 Treat this tree as GPL-2-or-later for the project as a whole unless a more
-specific file-level exception in `vendor/apt/COPYING` says otherwise.
+specific file-level exception says otherwise.
 
 ## Current Role
 
@@ -42,12 +36,11 @@ testing. The intended installed interface is just `gpkg` and `gpkg-worker`.
 
 ## Layout
 
-- `src/gpkg.cpp`: main CLI, repository handling, apt-backed dependency
-  planning, and backend dispatch
+- `src/gpkg.cpp`: main CLI, repository handling, dependency planning, and
+  backend dispatch
 - `src/gpkg_worker.cpp`: privileged worker for GeminiOS-native `.gpkg`
   extraction, registration, removal, and maintainer-script compatibility hooks
 - `src/*.ipp`: shared package-manager implementation fragments
-- `vendor/apt/`: vendored apt sources used by the Debian backend
 - `Makefile`: standalone build/install entrypoint for this module
 
 ## Build

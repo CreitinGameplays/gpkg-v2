@@ -4,10 +4,6 @@ STRIP = /usr/bin/strip
 PROJECT_ROOT ?= $(abspath $(CURDIR)/..)
 GINIT_DIR = $(PROJECT_ROOT)/ginit
 GLOBAL_SRC_DIR = $(PROJECT_ROOT)/src
-APT_VENDOR_DIR = vendor/apt
-APT_VENDOR_INCLUDE_DIR = $(APT_VENDOR_DIR)/include
-APT_PKG_DIR = $(APT_VENDOR_DIR)/apt-pkg
-APT_PRIVATE_DIR = $(APT_VENDOR_DIR)/apt-private
 SYS_INFO_HEADER ?= $(GLOBAL_SRC_DIR)/sys_info.h
 GPKG_VERSION_HELPER ?= $(PROJECT_ROOT)/tools/gpkg_version.py
 ROOTFS ?=
@@ -35,9 +31,7 @@ endif
 
 BASE_CXXFLAGS += -std=gnu++23 -Wall -Wextra -O2
 BASE_CXXFLAGS += -I./src -I$(GINIT_DIR)/src -I$(GLOBAL_SRC_DIR)
-BASE_CXXFLAGS += -I$(APT_VENDOR_INCLUDE_DIR) -I$(APT_PKG_DIR) -I$(APT_PRIVATE_DIR)
 BASE_CXXFLAGS += '-DGPKG_VERSION="$(GPKG_VERSION)"' '-DGPKG_CODENAME="$(GPKG_CODENAME)"'
-APT_VENDOR_CXXFLAGS += -DGPKG_HAVE_WORKING_LIBAPT_PKG_BACKEND -DAPT_COMPILING_APT -DHAVE_CONFIG_H
 ifneq ($(wildcard $(TARGET_ROOTFS)),)
 BASE_CXXFLAGS += --sysroot=$(TARGET_ROOTFS)
 BASE_LDFLAGS += --sysroot=$(TARGET_ROOTFS)
@@ -54,23 +48,8 @@ BASE_CXXFLAGS += -isystem $(TARGET_ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)
 BASE_CXXFLAGS += -isystem $(TARGET_ROOTFS)/usr/include/x86_64-linux-gnu/c++/$(TARGET_CXX_VERSION)
 BASE_CXXFLAGS += -isystem $(TARGET_ROOTFS)/usr/include/c++/$(TARGET_CXX_VERSION)/backward
 endif
-APT_VENDOR_SOURCES := $(sort $(shell find $(APT_PKG_DIR) -name '*.cc' -print))
 
-OPTIONAL_VENDOR_LIBS :=
-ifneq ($(wildcard $(TARGET_ROOTFS)/usr/lib/x86_64-linux-gnu/libsystemd.so*),)
-OPTIONAL_VENDOR_LIBS += -lsystemd
-endif
-ifneq ($(wildcard $(TARGET_ROOTFS)/usr/lib/x86_64-linux-gnu/libudev.so*),)
-OPTIONAL_VENDOR_LIBS += -ludev
-endif
-ifneq ($(wildcard $(TARGET_ROOTFS)/usr/lib/x86_64-linux-gnu/libseccomp.so*),)
-OPTIONAL_VENDOR_LIBS += -lseccomp
-endif
-ifneq ($(wildcard $(TARGET_ROOTFS)/usr/lib/x86_64-linux-gnu/libxxhash.so*),)
-OPTIONAL_VENDOR_LIBS += -lxxhash
-endif
-
-GPKG_LDFLAGS = $(BASE_LDFLAGS) $(LDFLAGS) -L$(GINIT_DIR)/lib -lgemcore -lssl -lcrypto -lz -lzstd -lbz2 -llz4 -ldl -lpthread -lcrypt -lresolv -lutil $(OPTIONAL_VENDOR_LIBS)
+GPKG_LDFLAGS = $(BASE_LDFLAGS) $(LDFLAGS) -L$(GINIT_DIR)/lib -lgemcore -lssl -lcrypto -lz -lzstd -lbz2 -llz4 -ldl -lpthread -lcrypt -lresolv -lutil
 ifeq ($(strip $(LZMA_STATIC)),)
 GPKG_LDFLAGS += -llzma
 else
@@ -91,7 +70,6 @@ SRCDIR = src
 OBJDIR = obj
 BINDIR = bin
 GPKG_FRAGMENTS = $(wildcard $(SRCDIR)/*.ipp)
-APT_VENDOR_OBJECTS := $(patsubst %.cc,$(OBJDIR)/%.o,$(APT_VENDOR_SOURCES))
 
 TARGETS = $(BINDIR)/gpkg $(BINDIR)/gpkg-worker
 BUILD_CONFIG_STAMP = $(OBJDIR)/build-config.stamp
@@ -115,10 +93,10 @@ $(BUILD_CONFIG_STAMP): FORCE | $(OBJDIR)
 
 $(OBJDIR)/%.o: %.cc $(BUILD_CONFIG_STAMP)
 	@mkdir -p $(dir $@)
-	$(CXX) $(BASE_CXXFLAGS) $(APT_VENDOR_CXXFLAGS) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) $(BASE_CXXFLAGS) $(CXXFLAGS) -c -o $@ $<
 
-$(BINDIR)/gpkg: $(SRCDIR)/gpkg.cpp $(GPKG_FRAGMENTS) $(APT_VENDOR_OBJECTS) $(BUILD_CONFIG_STAMP)
-	$(CXX) $(BASE_CXXFLAGS) $(APT_VENDOR_CXXFLAGS) $(CXXFLAGS) -o $@ $< $(APT_VENDOR_OBJECTS) $(GPKG_LDFLAGS)
+$(BINDIR)/gpkg: $(SRCDIR)/gpkg.cpp $(GPKG_FRAGMENTS) $(BUILD_CONFIG_STAMP)
+	$(CXX) $(BASE_CXXFLAGS) $(CXXFLAGS) -o $@ $< $(GPKG_LDFLAGS)
 	$(STRIP) $@
 
 $(BINDIR)/gpkg-worker: $(SRCDIR)/gpkg_worker.cpp $(GPKG_FRAGMENTS) $(BUILD_CONFIG_STAMP)

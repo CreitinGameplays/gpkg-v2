@@ -3070,12 +3070,13 @@ std::vector<std::string> build_dpkg_command_argv(const std::vector<std::string>&
 }
 
 std::string debian_backend_package_name(const PackageMetadata& meta) {
-    if (!meta.debian_package.empty()) return meta.debian_package;
+    std::string package_name = canonicalize_package_name(meta.name);
+    if (!package_name.empty()) return package_name;
     return meta.name;
 }
 
 bool package_uses_native_dpkg_backend(const PackageMetadata& meta) {
-    return package_is_debian_source(meta);
+    return meta.source_kind == "gpkg_repo" || meta.source_kind == "gpkg";
 }
 
 bool native_dpkg_status_requires_configuration(const std::string& status) {
@@ -7223,21 +7224,7 @@ int handle_doctor(bool verbose) {
     upgrade_section.title = "Upgrade dry-run";
 
     auto repo_urls = get_repo_urls();
-    repo_section.ok.push_back("Debian backend config: " + load_debian_backend_config(false).packages_url);
     repo_section.ok.push_back("Additional repositories configured: " + std::to_string(repo_urls.size()));
-    {
-        DebianBackendSelection backend = select_debian_backend(
-            DebianBackendOperation::PrepareUpgrade,
-            verbose
-        );
-        std::string backend_summary =
-            "Debian transaction backend: " + describe_debian_backend_kind(backend.selected);
-        if (backend.fell_back && !backend.reason.empty()) {
-            repo_section.warnings.push_back(backend_summary + " (" + backend.reason + ")");
-        } else {
-            repo_section.ok.push_back(backend_summary);
-        }
-    }
 
     const std::string merged_index = get_repo_catalog_path();
     struct stat index_st {};

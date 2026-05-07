@@ -3,7 +3,7 @@
 #include "gpkg_core.ipp"
 #include "gpkg_json.ipp"
 #include "gpkg_policy.ipp"
-#include "gpkg_debian.ipp"
+#include "gpkg_native_backend.ipp"
 #include "gpkg_repository.ipp"
 #include "gpkg_deps.ipp"
 #include "gpkg_libapt.ipp"
