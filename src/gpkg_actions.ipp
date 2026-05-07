@@ -7446,7 +7446,6 @@ int handle_repair(bool verbose) {
     std::cout << "Inspecting installed packages..." << std::endl;
     std::cout << "Optional dependency policy: " << describe_optional_dependency_policy() << std::endl;
     RepairInspection inspection = inspect_repair_state(verbose);
-    LibAptTransactionPlanResult libapt_plan;
 
     if (inspection.detected_issues.empty()) {
         std::cout << "No broken packages found." << std::endl;
@@ -7520,49 +7519,24 @@ int handle_repair(bool verbose) {
 
     std::vector<std::string> registered_packages = get_registered_package_names();
     std::set<std::string> installed_set(registered_packages.begin(), registered_packages.end());
-    std::string unsupported_reason;
-    if (!libapt_can_handle_repair_queue(repair_queue, &unsupported_reason)) {
-        std::cerr << Color::RED << "E: "
-                  << (unsupported_reason.empty()
-                          ? "libapt-pkg could not represent the requested repair transaction"
-                          : unsupported_reason)
-                  << Color::RESET << std::endl;
-        return 1;
-    }
-    std::vector<std::string> explicit_targets;
-    std::set<std::string> reinstall_targets;
-    for (const auto& meta : repair_queue) explicit_targets.push_back(meta.name);
-    for (const auto& meta : inspection.reinstall_queue) reinstall_targets.insert(meta.name);
-
-    std::string apt_error;
-    if (!libapt_plan_install_like_transaction(
-            explicit_targets,
-            reinstall_targets,
-            true,
+    TransactionPlan repair_plan;
+    std::string plan_error;
+    if (!build_transaction_plan(
+            repair_queue,
+            installed_set,
             verbose,
-            libapt_plan,
-            &apt_error
+            repair_plan,
+            nullptr,
+            &plan_error
         )) {
         std::cerr << Color::RED << "E: "
-                  << (apt_error.empty()
-                          ? "libapt-pkg could not build a repair transaction"
-                          : apt_error)
+                  << (plan_error.empty()
+                          ? "could not build a safe repair transaction"
+                          : plan_error)
                   << Color::RESET << std::endl;
         return 1;
     }
-    {
-        std::string live_session_reason;
-        if (libapt_plan_is_unsafe_for_live_session(libapt_plan, verbose, &live_session_reason)) {
-            std::cerr << Color::RED << "E: "
-                      << (live_session_reason.empty()
-                              ? "refusing to modify essential base packages in a live GeminiOS session"
-                              : live_session_reason)
-                      << Color::RESET << std::endl;
-            return 1;
-        }
-    }
-    repair_queue = collect_libapt_install_queue(libapt_plan);
-    print_libapt_remove_preview(libapt_plan);
+    repair_queue = repair_plan.install_queue;
     if (!ask_confirmation("Do you want to continue with the repair?")) return 0;
 
     std::cout << Color::CYAN << "[*] Downloading "
@@ -7599,42 +7573,15 @@ int handle_repair(bool verbose) {
 
     std::cout << Color::CYAN << "[*] Applying repair plan..." << Color::RESET << std::endl;
     size_t repaired_count = 0;
-    std::vector<std::string> failures;
-    bool mutated_runtime_state = false;
-    if (libapt_plan.ordered_operations.empty()) {
-        std::cerr << Color::RED
-                  << "E: libapt-pkg did not produce an executable operation order for this repair"
-                  << Color::RESET << std::endl;
-        return 1;
-    }
-
-    LibAptExecutionResult exec_result = execute_libapt_install_like_plan(
-        libapt_plan,
-        nullptr,
-        {},
-        installed_set,
-        verbose,
-        !libapt_plan.auto_state_after.empty() ? &libapt_plan.auto_state_after : nullptr
-    );
-    if (!exec_result.success) {
-        std::string failed_name = exec_result.failed_package.empty()
-            ? (repair_queue.empty() ? std::string() : repair_queue.front().name)
-            : exec_result.failed_package;
-        std::cerr << Color::RED << "E: Repair stopped";
-        if (!failed_name.empty()) std::cerr << " at " << failed_name;
-        std::cerr << Color::RESET;
-        if (!verbose && !exec_result.log_path.empty()) {
-            std::cerr << " (see " << exec_result.log_path << ")";
-        }
-        std::cerr << std::endl;
-        failures.push_back(failed_name.empty() ? "unknown" : failed_name);
-    } else {
-        repaired_count = exec_result.installed_count;
-        mutated_runtime_state = exec_result.mutated_runtime_state;
-    }
-
-    if (!failures.empty()) {
-        if (mutated_runtime_state) queue_runtime_linker_state_refresh();
+    if (!execute_native_install_queue(
+            repair_queue,
+            repair_plan,
+            {},
+            installed_set,
+            verbose,
+            &repaired_count
+        )) {
+        queue_runtime_linker_state_refresh();
         return 1;
     }
 
@@ -7644,12 +7591,12 @@ int handle_repair(bool verbose) {
     std::cout << "Rechecking package state..." << std::endl;
     RepairInspection after_repair = inspect_repair_state(false);
     if (after_repair.detected_issues.empty()) {
-        if (mutated_runtime_state) queue_runtime_linker_state_refresh();
+        queue_runtime_linker_state_refresh();
         std::cout << Color::GREEN << "✓ Repair completed successfully." << Color::RESET << std::endl;
         return 0;
     }
 
-    if (mutated_runtime_state) queue_runtime_linker_state_refresh();
+    queue_runtime_linker_state_refresh();
 
     std::cerr << Color::YELLOW
               << "W: Repair completed, but some issues remain:"
@@ -8260,65 +8207,50 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
         return 1;
     }
 
-    if (!libapt_can_handle_remove_target(target_pkg, purge)) {
-        std::cerr << Color::RED
-                  << "E: libapt-pkg could not represent the requested removal target"
-                  << Color::RESET << std::endl;
-        return 1;
-    }
-    if (autoremove && libapt_has_non_native_auto_installed_packages()) {
-        std::cerr << Color::RED
-                  << "E: libapt-pkg cannot safely autoremove while non-native auto-installed packages remain"
-                  << Color::RESET << std::endl;
-        return 1;
-    }
-
-    LibAptTransactionPlanResult libapt_plan;
-    std::string apt_error;
-    if (!libapt_plan_remove_transaction({target_pkg}, purge, autoremove, verbose, libapt_plan, &apt_error)) {
-        std::cerr << Color::RED << "E: "
-                  << (apt_error.empty()
-                          ? "libapt-pkg could not build a safe removal transaction"
-                          : apt_error)
-                  << Color::RESET << std::endl;
-        return 1;
-    }
-
-    std::set<std::string> protected_kernel_packages =
-        autoremove ? get_autoremove_protected_kernel_packages(verbose) : std::set<std::string>{};
-    std::map<std::string, std::string> skipped_protected_packages;
-    std::set<std::string> skipped_kernel_packages;
     std::vector<std::string> to_remove;
-    std::set<std::string> removal_set;
-    for (const auto& pkg : libapt_plan.remove_packages) {
-        if (pkg != target_pkg) {
-            std::string auto_reason;
-            if (package_is_removal_protected(pkg, &auto_reason)) {
-                skipped_protected_packages[pkg] = auto_reason;
-                continue;
-            }
-            if (protected_kernel_packages.count(pkg) != 0) {
-                skipped_kernel_packages.insert(pkg);
-                continue;
-            }
-        }
-        if (removal_set.insert(pkg).second) to_remove.push_back(pkg);
+    std::set<std::string> preplanned_removals;
+    if (target_installed) {
+        to_remove.push_back(target_pkg);
+        preplanned_removals.insert(target_pkg);
+    }
+
+    if (target_installed && !autoremove &&
+        is_required_by_others(target_pkg, preplanned_removals, verbose)) {
+        std::cerr << Color::RED
+                  << "E: Cannot remove '" << target_pkg
+                  << "' because other installed packages still depend on it."
+                  << Color::RESET << std::endl;
+        return 1;
+    }
+
+    std::set<std::string> protected_kernel_packages;
+    std::map<std::string, std::string> skipped_protected_packages;
+    if (autoremove) {
+        protected_kernel_packages = get_autoremove_protected_kernel_packages(verbose);
+        std::vector<std::string> auto_removals = collect_autoremove_packages(
+            preplanned_removals,
+            verbose,
+            &protected_kernel_packages,
+            &skipped_protected_packages
+        );
+        to_remove.insert(to_remove.end(), auto_removals.begin(), auto_removals.end());
     }
 
     std::vector<std::string> to_purge;
-    std::set<std::string> purge_set;
     if (purge) {
-        if (target_config_files && purge_set.insert(target_pkg).second) {
+        if (target_config_files) {
             to_purge.push_back(target_pkg);
         }
-        for (const auto& pkg : libapt_plan.purge_packages) {
-            if (purge_set.insert(pkg).second) to_purge.push_back(pkg);
+        for (const auto& pkg : to_remove) {
+            if (std::find(to_purge.begin(), to_purge.end(), pkg) == to_purge.end()) {
+                to_purge.push_back(pkg);
+            }
         }
     }
 
-    if (!skipped_kernel_packages.empty()) {
+    if (!protected_kernel_packages.empty() && autoremove) {
         std::cout << "Keeping protected kernel package(s):";
-        for (const auto& pkg : skipped_kernel_packages) std::cout << " " << pkg;
+        for (const auto& pkg : protected_kernel_packages) std::cout << " " << pkg;
         std::cout << std::endl;
     }
     if (!skipped_protected_packages.empty()) {
@@ -8328,42 +8260,22 @@ int handle_remove(int argc, char* argv[], bool verbose, bool purge, bool autorem
         }
     }
 
-    return execute_removal_plan(to_remove, to_purge, verbose, &libapt_plan);
+    return execute_removal_plan(to_remove, to_purge, verbose);
 }
 
 int handle_autoremove(bool verbose, bool purge) {
     std::cout << "Calculating removable packages..." << std::endl;
 
-    if (libapt_has_non_native_auto_installed_packages()) {
-        std::cerr << Color::RED
-                  << "E: libapt-pkg cannot safely autoremove while non-native auto-installed packages remain"
-                  << Color::RESET << std::endl;
-        return 1;
-    }
-    LibAptTransactionPlanResult libapt_plan;
-    std::string apt_error;
-    if (!libapt_plan_remove_transaction({}, purge, true, verbose, libapt_plan, &apt_error)) {
-        std::cerr << Color::RED << "E: "
-                  << (apt_error.empty()
-                          ? "libapt-pkg could not build an autoremove transaction"
-                          : apt_error)
-                  << Color::RESET << std::endl;
-        return 1;
-    }
-
-    std::set<std::string> skipped_kernel_packages = get_autoremove_protected_kernel_packages(verbose);
+    std::set<std::string> skipped_kernel_packages;
     std::map<std::string, std::string> skipped_protected_packages;
-    std::vector<std::string> to_remove;
     std::set<std::string> selected;
-    for (const auto& pkg : libapt_plan.remove_packages) {
-        std::string protection_reason;
-        if (package_is_removal_protected(pkg, &protection_reason)) {
-            skipped_protected_packages[pkg] = protection_reason;
-            continue;
-        }
-        if (skipped_kernel_packages.count(pkg) != 0) continue;
-        if (selected.insert(pkg).second) to_remove.push_back(pkg);
-    }
+    std::vector<std::string> to_remove = collect_autoremove_packages(
+        {},
+        verbose,
+        &skipped_kernel_packages,
+        &skipped_protected_packages
+    );
+    selected.insert(to_remove.begin(), to_remove.end());
 
     if (!skipped_kernel_packages.empty()) {
         std::cout << "Keeping protected kernel package(s):";
@@ -8388,5 +8300,5 @@ int handle_autoremove(bool verbose, bool purge) {
         to_purge.erase(std::unique(to_purge.begin(), to_purge.end()), to_purge.end());
     }
 
-    return execute_removal_plan(to_remove, to_purge, verbose, &libapt_plan);
+    return execute_removal_plan(to_remove, to_purge, verbose);
 }
