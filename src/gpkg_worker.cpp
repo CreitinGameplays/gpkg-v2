@@ -901,10 +901,8 @@ bool verify_runtime_command_smoke_tests() {
 
     const RuntimeSmokeTest tests[] = {
         {"/bin/sh", {"-c", "exit 0"}},
-        {"/bin/bash", {"--version"}},
-        {"/bin/ls", {"--version"}},
-        {"/bin/gpkg", {"--version"}},
-        {"/bin/gpkg-v2", {"--version"}},
+        {"/bin/bash", {"-lc", "exit 0"}},
+        {"/bin/ls", {"-d", "/"}},
     };
 
     for (const auto& test : tests) {

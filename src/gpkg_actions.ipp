@@ -2707,6 +2707,61 @@ std::vector<std::string> collect_normalized_upgrade_roots(
     for (const auto& pkg : context.registered_package_names) add_upgrade_root(pkg);
     for (const auto& pkg : context.upgrade_catalog.resolved_roots) add_upgrade_root(pkg);
 
+    bool have_installed_kernel_channel = false;
+    for (const auto& pkg : context.registered_package_names) {
+        if (pkg == "geminios-kernel-stable" ||
+            pkg == "geminios-kernel-mainline" ||
+            pkg == "geminios-kernel-next") {
+            have_installed_kernel_channel = true;
+            break;
+        }
+    }
+
+    if (!have_installed_kernel_channel) {
+        std::string running_release = read_running_kernel_release();
+        std::string current_kernel_package;
+        std::string current_kernel_version;
+
+        for (const auto& pkg : context.registered_package_names) {
+            InstalledKernelPayloadInfo info;
+            if (!get_installed_kernel_payload_info(pkg, &info)) continue;
+
+            if (!running_release.empty() && info.release == running_release) {
+                current_kernel_package = info.package;
+                current_kernel_version = info.version;
+                break;
+            }
+
+            if (current_kernel_package.empty()) {
+                current_kernel_package = info.package;
+                current_kernel_version = info.version;
+            }
+        }
+
+        if (!current_kernel_package.empty()) {
+            static const std::vector<std::string> preferred_kernel_channels = {
+                "geminios-kernel-stable",
+                "geminios-kernel-mainline",
+                "geminios-kernel-next",
+            };
+
+            for (const auto& channel_pkg : preferred_kernel_channels) {
+                PackageMetadata channel_meta;
+                if (!get_repo_package_info(channel_pkg, channel_meta)) continue;
+                if (channel_meta.version.empty() || current_kernel_version.empty()) continue;
+
+                if (compare_versions(channel_meta.version, current_kernel_version) > 0) {
+                    VLOG(verbose,
+                         "Detected newer kernel channel " << channel_pkg
+                         << " (" << channel_meta.version << " > " << current_kernel_version
+                         << "); adding it to the upgrade roots.");
+                    add_upgrade_root(channel_pkg);
+                    break;
+                }
+            }
+        }
+    }
+
     std::vector<std::string> normalized_roots;
     std::set<std::string> emitted_targets;
     for (const auto& raw_name : raw_roots) {
