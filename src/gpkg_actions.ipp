@@ -40,6 +40,12 @@ struct ScopedNativeDebianBatchStage {
     }
 };
 
+struct InstalledKernelPayloadInfo {
+    std::string package;
+    std::string version;
+    std::string release;
+};
+
 bool prepare_install_archives(
     const std::vector<PackageMetadata>& packages,
     const DownloadBatchReport& download_report,
@@ -107,6 +113,10 @@ InstallCommandResult install_native_debian_batch(
     size_t progress_base = 0,
     size_t progress_total = 0,
     size_t* progress_width = nullptr
+);
+bool get_installed_kernel_payload_info(
+    const std::string& pkg_name,
+    InstalledKernelPayloadInfo* out = nullptr
 );
 
 bool update_package_auto_install_state_after_install(
@@ -6101,13 +6111,7 @@ bool verify_installed_package(const std::string& pkg_name, bool verbose, std::st
     return result.exit_code == 0;
 }
 
-struct InstalledKernelPayloadInfo {
-    std::string package;
-    std::string version;
-    std::string release;
-};
-
-bool get_installed_kernel_payload_info(const std::string& pkg_name, InstalledKernelPayloadInfo* out = nullptr) {
+bool get_installed_kernel_payload_info(const std::string& pkg_name, InstalledKernelPayloadInfo* out) {
     PackageMetadata meta;
     if (!get_installed_package_metadata(pkg_name, meta)) return false;
 
